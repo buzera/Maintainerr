@@ -1,0 +1,217 @@
+---
+name: "Fork test image (overlay scope)"
+
+# Fork-only. Lives on the ci/overlay-scope-image branch, never on a branch
+# proposed upstream.
+#
+# - A push to ci/overlay-scope-image builds a native linux/amd64 image from
+#   that commit with the repository Dockerfile and smoke-tests it. Nothing is
+#   published.
+# - Publishing needs the fork owner's approval, given by pushing a tag named
+#   overlay-scope-test.<n> (for example overlay-scope-test.1). The tag name is
+#   the image tag, so every published image is versioned and none is "latest".
+# - Images only ever go to ghcr.io/<fork owner>/maintainerr-overlay-scope. The
+#   workflow refuses to run in, or publish to, the Maintainerr namespaces, and
+#   it never logs in to Docker Hub.
+
+"on":
+  push:
+    branches:
+      - ci/overlay-scope-image
+    tags:
+      - "overlay-scope-test.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-overlay-scope-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: maintainerr-overlay-scope
+
+jobs:
+  build:
+    name: Build and smoke-test linux/amd64
+    if: github.repository_owner != 'Maintainerr' && github.repository_owner != 'maintainerr'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Compute version
+        id: vars
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="overlay-scope-build.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Version: $version (commit ${GITHUB_SHA})"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build linux/amd64
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:ci
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.vars.outputs.version }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            VERSION_TAG=${{ steps.vars.outputs.version }}
+          cache-from: type=gha,scope=overlay-scope-amd64
+          cache-to: type=gha,mode=max,scope=overlay-scope-amd64
+
+      - name: Check the image is linux/amd64
+        shell: bash
+        run: |
+          platform="$(docker image inspect "${IMAGE_NAME}:ci" --format '{{.Os}}/{{.Architecture}}')"
+          echo "Image platform: $platform"
+          test "$platform" = "linux/amd64"
+
+      - name: Smoke test on a fresh volume, with no network
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker volume create smoke-data >/dev/null
+          docker run --rm -v smoke-data:/d alpine:3 chown 1000:1000 /d
+          # --network none: the container cannot reach anything at all.
+          docker run -d --name smoke --network none --user 1000:1000 \
+            -e TZ=UTC -v smoke-data:/opt/data "${IMAGE_NAME}:ci"
+
+          status=starting
+          for _ in $(seq 1 60); do
+            status="$(docker inspect -f '{{.State.Health.Status}}' smoke)"
+            [ "$status" = "healthy" ] && break
+            sleep 5
+          done
+          docker logs smoke 2>&1 | tail -n 20
+          echo "Health: $status"
+          test "$status" = "healthy"
+
+          docker exec smoke curl -fsS http://127.0.0.1:6246/api/health/ready
+          echo
+          # The migration this branch adds ran, and the column has its default.
+          docker exec -w /opt/app/apps/server smoke node -e '
+            const db = require("better-sqlite3")("/opt/data/maintainerr.sqlite", { readonly: true });
+            const applied = db.prepare("SELECT name FROM migrations WHERE name LIKE ?").get("AddCollectionOverlayScope%");
+            const column = db.prepare("SELECT dflt_value FROM pragma_table_info(?) WHERE name = ?").get("collection", "overlayScope");
+            console.log("migration:", applied && applied.name, "default:", column && column.dflt_value);
+            if (!applied || !column || column.dflt_value !== "'"'"'all'"'"'") process.exit(1);
+          '
+          # The UI being served is the one with the new field.
+          docker exec smoke sh -c 'grep -rl "Overlay scope" /opt/data/ui/assets | head -n 1' | grep -q .
+          docker rm -f smoke >/dev/null
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Overlay scope test image"
+            echo ""
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Version: \`${{ steps.vars.outputs.version }}\`"
+            echo "- Platform: linux/amd64"
+            echo "- Build and smoke test: ${{ job.status }}"
+            if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+              echo "- Not published. Push a tag \`overlay-scope-test.<n>\` on this commit to publish."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save the tested image
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: docker save "${IMAGE_NAME}:ci" | gzip > "${RUNNER_TEMP}/image.tar.gz"
+
+      - name: Upload the tested image
+        if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@v7
+        with:
+          name: overlay-scope-image
+          path: ${{ runner.temp }}/image.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish to the fork's GHCR
+    needs: build
+    if: >-
+      github.ref_type == 'tag' &&
+      startsWith(github.ref_name, 'overlay-scope-test.') &&
+      github.repository_owner != 'Maintainerr' &&
+      github.repository_owner != 'maintainerr'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Resolve the target, refusing the Maintainerr namespaces
+        id: target
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          if [ "$owner" = "maintainerr" ]; then
+            echo "Refusing to publish to the Maintainerr namespace" >&2
+            exit 1
+          fi
+          case "$VERSION" in
+            overlay-scope-test.*) ;;
+            *) echo "Unexpected version '$VERSION'" >&2; exit 1 ;;
+          esac
+          echo "ref=ghcr.io/${owner}/${IMAGE_NAME}:${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download the tested image
+        uses: actions/download-artifact@v8
+        with:
+          name: overlay-scope-image
+          path: ${{ runner.temp }}
+
+      - name: Load the tested image
+        shell: bash
+        run: gunzip -c "${RUNNER_TEMP}/image.tar.gz" | docker load
+
+      - name: Log in to the fork's GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        shell: bash
+        env:
+          REF: ${{ steps.target.outputs.ref }}
+        run: |
+          set -euo pipefail
+          docker tag "${IMAGE_NAME}:ci" "$REF"
+          docker push "$REF"
+          digest="$(docker image inspect "$REF" --format '{{index .RepoDigests 0}}')"
+          echo "Published $REF"
+          echo "Digest: $digest"
+          {
+            echo "### Published"
+            echo ""
+            echo "- Image: \`$REF\`"
+            echo "- Pin by digest: \`$digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
