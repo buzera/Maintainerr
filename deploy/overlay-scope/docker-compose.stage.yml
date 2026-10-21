@@ -1,0 +1,45 @@
+# Staging for the overlay scope test image.
+#
+# Everything here is separate from production: its own project name,
+# container name, loopback-only port, data volume and network. No media,
+# no production data directory and no overlay originals are mounted, and the
+# fresh database holds no media server, *arr or request-service credentials,
+# so this instance has nothing it could delete and no artwork it could touch.
+# Connect it only to test fixtures - never to the production Plex, Radarr,
+# Sonarr, Tautulli or Ombi.
+#
+#   IMAGE=ghcr.io/buzera/maintainerr-overlay-scope:overlay-scope-test.1 \
+#     docker compose -f docker-compose.stage.yml up -d
+#   docker compose -f docker-compose.stage.yml down        # keeps the volume
+#   docker compose -f docker-compose.stage.yml down -v     # and drops it
+#
+# Pin IMAGE by digest once published (ghcr.io/...@sha256:...).
+name: maintainerr-stage
+
+services:
+  maintainerr-stage:
+    image: ${IMAGE:?set IMAGE to the overlay scope test image}
+    platform: linux/amd64
+    container_name: maintainerr-stage
+    user: "1000:1000"
+    environment:
+      TZ: ${TZ:-UTC}
+    ports:
+      - "127.0.0.1:6247:6246"
+    volumes:
+      - maintainerr-stage-data:/opt/data
+    networks:
+      - maintainerr-stage
+    restart: "no"
+    mem_limit: 1g
+    labels:
+      # Watchtower must never swap this image.
+      com.centurylinklabs.watchtower.enable: "false"
+
+volumes:
+  maintainerr-stage-data:
+    name: maintainerr-stage-data
+
+networks:
+  maintainerr-stage:
+    name: maintainerr-stage
