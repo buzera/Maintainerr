@@ -7,9 +7,9 @@ directory, when the show poster alone says the same thing.
 
 - **Overlay scope** in the rule editor, under "Enable overlays", for a show
   rule with overlays on: Show only, Show + seasons, Show + seasons +
-  episodes. The last is the default and what the generated migration gives
-  every existing collection (`collection.overlayScope`, `NOT NULL DEFAULT
-'all'`), so nothing changes until a scope is picked.
+  episodes. The last is the default, and the generated migration gives it to
+  every existing collection (new column `collection.overlayScope`, default
+  `all`), so nothing changes until a scope is picked.
 - The scope trims the inheritance walk, not the uploads it leads to: Show
   only reads no seasons or episodes, Show + seasons reads no episode lists.
   Membership, delete dates and the collection action are untouched. Season

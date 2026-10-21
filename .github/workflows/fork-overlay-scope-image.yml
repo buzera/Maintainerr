@@ -1,25 +1,37 @@
 ---
 name: "Fork test image (overlay scope)"
 
-# Fork-only. Lives on the ci/overlay-scope-image branch, never on a branch
-# proposed upstream.
+# Fork-only. Lives on the ci/* branches below, never on a branch proposed
+# upstream. The same file is on both, and builds one of two images:
 #
-# - A push to ci/overlay-scope-image builds a native linux/amd64 image from
-#   that commit with the repository Dockerfile and smoke-tests it. Nothing is
-#   published.
-# - Publishing needs the fork owner's approval, given by pushing a tag named
-#   overlay-scope-test.<n> (for example overlay-scope-test.1). The tag name is
-#   the image tag, so every published image is versioned and none is "latest".
+# | Branch / tag                         | Built from                              | Image tag              |
+# | ------------------------------------ | --------------------------------------- | ---------------------- |
+# | ci/overlay-scope-image-3.30.2        | v3.30.2 + the overlay scope commit only | 3.30.2-build.<run>     |
+# | tag 3.30.2-test.<n>                  | same, published                         | 3.30.2-test.<n>        |
+# | ci/overlay-scope-image               | development + the overlay scope commit  | overlay-scope-build.<run> |
+# | tag overlay-scope-test.<n>           | same, published                         | overlay-scope-test.<n> |
+#
+# - A branch push builds a native linux/amd64 image with the repository
+#   Dockerfile and smoke-tests it. Nothing is published.
+# - Publishing needs the fork owner's approval, given by pushing one of the
+#   tags above. Every published image is versioned; none is "latest", and an
+#   existing tag is never overwritten.
 # - Images only ever go to ghcr.io/<fork owner>/maintainerr-overlay-scope. The
 #   workflow refuses to run in, or publish to, the Maintainerr namespaces, and
 #   it never logs in to Docker Hub.
+# - A v3.30.2 build refuses to run unless the app code is exactly the v3.30.2
+#   release plus one commit; files under .github/ and deploy/ are the only
+#   other changes allowed. A development build refuses a commit of that shape,
+#   so the two tag families cannot be mixed up.
 
 "on":
   push:
     branches:
       - ci/overlay-scope-image
+      - ci/overlay-scope-image-3.30.2
     tags:
       - "overlay-scope-test.*"
+      - "3.30.2-test.*"
 
 permissions:
   contents: read
@@ -30,6 +42,8 @@ concurrency:
 
 env:
   IMAGE_NAME: maintainerr-overlay-scope
+  # chore(release): 3.30.2, the commit the upstream v3.30.2 tag points at.
+  V3_30_2_COMMIT: 569008e60ea9ebebebebb24d25ec99e297022f9c
 
 jobs:
   build:
@@ -39,22 +53,54 @@ jobs:
     timeout-minutes: 60
     outputs:
       version: ${{ steps.vars.outputs.version }}
+      target: ${{ steps.vars.outputs.target }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
-      - name: Compute version
+      - name: Resolve the target and check the source
         id: vars
         shell: bash
         run: |
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            version="$GITHUB_REF_NAME"
-          else
-            version="overlay-scope-build.${GITHUB_RUN_NUMBER}"
+          set -euo pipefail
+          case "${GITHUB_REF_TYPE}:${GITHUB_REF_NAME}" in
+            branch:ci/overlay-scope-image-3.30.2)
+              target=v3.30.2 version="3.30.2-build.${GITHUB_RUN_NUMBER}" ;;
+            tag:3.30.2-test.*)
+              target=v3.30.2 version="$GITHUB_REF_NAME" ;;
+            branch:ci/overlay-scope-image)
+              target=development version="overlay-scope-build.${GITHUB_RUN_NUMBER}" ;;
+            tag:overlay-scope-test.*)
+              target=development version="$GITHUB_REF_NAME" ;;
+            *)
+              echo "Unexpected ref ${GITHUB_REF_TYPE} ${GITHUB_REF_NAME}" >&2; exit 1 ;;
+          esac
+
+          app_paths=(-- . ':(exclude).github/workflows/fork-overlay-scope-image.yml' ':(exclude)deploy/overlay-scope')
+          shape=development
+          if git merge-base --is-ancestor "$V3_30_2_COMMIT" HEAD; then
+            app_commits="$(git rev-list "${V3_30_2_COMMIT}..HEAD" "${app_paths[@]}")"
+            if [ "$(printf '%s' "$app_commits" | grep -c .)" -eq 1 ]; then
+              shape=v3.30.2
+            fi
           fi
+          if [ "$shape" != "$target" ]; then
+            echo "${GITHUB_REF_NAME} builds a ${target} image, but this commit is ${shape}-based" >&2
+            exit 1
+          fi
+          app_commit="$(git rev-list -1 HEAD "${app_paths[@]}")"
+
+          if [ "$target" = "v3.30.2" ]; then
+            echo "Commits on top of v3.30.2:"
+            git log --format='  %h %s' "${V3_30_2_COMMIT}..HEAD"
+          fi
+          echo "target=$target" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Version: $version (commit ${GITHUB_SHA})"
+          echo "app_commit=$app_commit" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Source::${target} build ${version}, app commit ${app_commit}, workflow commit ${GITHUB_SHA}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -70,13 +116,15 @@ jobs:
           tags: ${{ env.IMAGE_NAME }}:ci
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ steps.vars.outputs.app_commit }}
             org.opencontainers.image.version=${{ steps.vars.outputs.version }}
+            io.github.buzera.overlay-scope.base=${{ steps.vars.outputs.target }}
+            io.github.buzera.overlay-scope.workflow-commit=${{ github.sha }}
           build-args: |
-            GIT_SHA=${{ github.sha }}
+            GIT_SHA=${{ steps.vars.outputs.app_commit }}
             VERSION_TAG=${{ steps.vars.outputs.version }}
-          cache-from: type=gha,scope=overlay-scope-amd64
-          cache-to: type=gha,mode=max,scope=overlay-scope-amd64
+          cache-from: type=gha,scope=overlay-scope-${{ steps.vars.outputs.target }}
+          cache-to: type=gha,mode=max,scope=overlay-scope-${{ steps.vars.outputs.target }}
 
       - name: Check the image is linux/amd64
         shell: bash
@@ -118,6 +166,8 @@ jobs:
           # The UI being served is the one with the new field.
           docker exec smoke sh -c 'grep -rl "Overlay scope" /opt/data/ui/assets | head -n 1' | grep -q .
           docker rm -f smoke >/dev/null
+          image_id="$(docker image inspect "${IMAGE_NAME}:ci" --format '{{.Id}}')"
+          echo "::notice title=Smoke test passed::${{ steps.vars.outputs.version }} linux/amd64 image ${image_id}"
 
       - name: Summary
         if: always()
@@ -126,12 +176,14 @@ jobs:
           {
             echo "### Overlay scope test image"
             echo ""
-            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- Base: \`${{ steps.vars.outputs.target }}\`"
+            echo "- App commit: \`${{ steps.vars.outputs.app_commit }}\`"
+            echo "- Workflow commit: \`${GITHUB_SHA}\`"
             echo "- Version: \`${{ steps.vars.outputs.version }}\`"
             echo "- Platform: linux/amd64"
             echo "- Build and smoke test: ${{ job.status }}"
             if [ "$GITHUB_REF_TYPE" != "tag" ]; then
-              echo "- Not published. Push a tag \`overlay-scope-test.<n>\` on this commit to publish."
+              echo "- Not published. Push a release tag on this commit to publish (see the header of this workflow)."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -154,7 +206,7 @@ jobs:
     needs: build
     if: >-
       github.ref_type == 'tag' &&
-      startsWith(github.ref_name, 'overlay-scope-test.') &&
+      (startsWith(github.ref_name, 'overlay-scope-test.') || startsWith(github.ref_name, '3.30.2-test.')) &&
       github.repository_owner != 'Maintainerr' &&
       github.repository_owner != 'maintainerr'
     runs-on: ubuntu-24.04
@@ -169,15 +221,16 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ needs.build.outputs.version }}
+          TARGET: ${{ needs.build.outputs.target }}
         run: |
           owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
           if [ "$owner" = "maintainerr" ]; then
             echo "Refusing to publish to the Maintainerr namespace" >&2
             exit 1
           fi
-          case "$VERSION" in
-            overlay-scope-test.*) ;;
-            *) echo "Unexpected version '$VERSION'" >&2; exit 1 ;;
+          case "${TARGET}:${VERSION}" in
+            v3.30.2:3.30.2-test.*|development:overlay-scope-test.*) ;;
+            *) echo "Unexpected version '$VERSION' for a ${TARGET} build" >&2; exit 1 ;;
           esac
           echo "ref=ghcr.io/${owner}/${IMAGE_NAME}:${VERSION}" >> "$GITHUB_OUTPUT"
 
@@ -198,17 +251,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push
+      - name: Push, never over an existing tag
         shell: bash
         env:
           REF: ${{ steps.target.outputs.ref }}
         run: |
           set -euo pipefail
+          if docker manifest inspect "$REF" >/dev/null 2>&1; then
+            echo "$REF already exists; push a new tag number instead of overwriting it" >&2
+            exit 1
+          fi
           docker tag "${IMAGE_NAME}:ci" "$REF"
           docker push "$REF"
           digest="$(docker image inspect "$REF" --format '{{index .RepoDigests 0}}')"
           echo "Published $REF"
           echo "Digest: $digest"
+          echo "::notice title=Published::${REF} ${digest}"
           {
             echo "### Published"
             echo ""
